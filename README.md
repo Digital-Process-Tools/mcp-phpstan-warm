@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="mcp-phpstan-warm — worker stays warm. analysis stays fast." width="900">
+</p>
+
 # mcp-phpstan-warm
 
 > **Stop paying PHPStan's cold-start tax on every edit.**
