@@ -1,0 +1,13 @@
+{
+    "name": "dpt/mcp-phpstan-warm-fixture",
+    "description": "Minimal fixture project for mcp-phpstan-warm integration tests.",
+    "type": "project",
+    "require": {
+        "php": ">=8.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "": "src/"
+        }
+    }
+}

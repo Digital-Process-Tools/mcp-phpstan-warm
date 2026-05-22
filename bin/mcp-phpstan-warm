@@ -1,0 +1,59 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+@ini_set('memory_limit', '-1');
+// Dual-mode autoload: local clone vs. composer-global install.
+foreach ([
+    __DIR__ . '/../vendor/autoload.php',       // local dev: composer install in this repo
+    __DIR__ . '/../../../autoload.php',         // composer global / project-local require
+] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+use Mcp\Server;
+use Mcp\Server\Transport\StdioTransport;
+
+$workingDir = null;
+$config     = null;
+$paths      = null;
+
+foreach (array_slice($argv, 1) as $arg) {
+    if (str_starts_with($arg, '--working-dir=')) {
+        $workingDir = substr($arg, 14);
+    } elseif (str_starts_with($arg, '--config=')) {
+        $config = substr($arg, 9);
+    } elseif (str_starts_with($arg, '--paths=')) {
+        $paths = substr($arg, 8);
+    }
+}
+
+if ($workingDir !== null) {
+    if (!is_dir($workingDir)) {
+        fwrite(STDERR, "mcp-phpstan-warm: --working-dir not a directory: {$workingDir}\n");
+        exit(2);
+    }
+    chdir($workingDir);
+}
+
+if ($paths === null) {
+    fwrite(STDERR, "mcp-phpstan-warm: --paths is required (comma-separated paths the worker will analyse)\n");
+    exit(2);
+}
+
+// Pass config and paths to PhpstanRunner via env vars, keeping $_SERVER['argv'] clean for the MCP SDK.
+if ($config !== null) {
+    putenv('MCP_PHPSTAN_CONFIG=' . $config);
+}
+putenv('MCP_PHPSTAN_PATHS=' . $paths);
+
+$server = Server::builder()
+    ->setServerInfo('mcp-phpstan-warm', '0.1.0')
+    ->setDiscovery(dirname(__DIR__), ['src'])
+    ->build();
+
+$server->run(new StdioTransport());
