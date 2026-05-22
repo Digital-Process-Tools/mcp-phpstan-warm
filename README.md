@@ -140,6 +140,8 @@ Three things worth knowing:
 
 **Memory?** The daemon sets `memory_limit = -1`. Idle worker ≈ 60-80MB resident depending on project size and PHPStan level.
 
+**Are `ignoreErrors` from my neon respected?** Yes. At worker boot the daemon runs `phpstan dump-parameters --json` once to extract the project's `ignoreErrors` list and caches it. Every `phpstan_analyse` call filters worker results through that list — by identifier, message regex, or path glob — before returning errors to the MCP client. The output matches what `phpstan analyse` would show on the same file.
+
 **Does it survive PHPStan version updates?** The TCP protocol (`hello` / `analyse` / `result`) is PHPStan's internal parallel transport — it's stable across patch versions. Pin a PHPStan version in your `composer.json` if you need determinism.
 
 **Why not just subprocess `phpstan analyse` and cache the result?** You could. But you'd still pay the full cold-start on every cache miss (every new or modified file). The worker mode amortises that cost across the entire session.

@@ -84,6 +84,50 @@ final class ServerStdioTest extends TestCase
         self::assertArrayHasKey('message', $structured['errors'][0]);
     }
 
+    public function testAnalyseFiltersIgnoredErrors(): void
+    {
+        $ignoredNeon = self::$fixtureDir . '/phpstan-with-ignores.neon';
+        if (!is_file($ignoredNeon)) {
+            self::markTestSkipped('phpstan-with-ignores.neon fixture missing');
+        }
+
+        $messages = [
+            ['jsonrpc' => '2.0', 'id' => 1, 'method' => 'initialize', 'params' => [
+                'protocolVersion' => '2024-11-05',
+                'capabilities'    => new \stdClass(),
+                'clientInfo'      => ['name' => 'phpunit', 'version' => '1.0.0'],
+            ]],
+            ['jsonrpc' => '2.0', 'method' => 'notifications/initialized'],
+            ['jsonrpc' => '2.0', 'id' => 2, 'method' => 'tools/call', 'params' => [
+                'name'      => 'phpstan_analyse',
+                'arguments' => ['path' => self::$fixtureFile],
+            ]],
+        ];
+
+        $args = [
+            '--working-dir=' . self::$fixtureDir,
+            '--config=' . $ignoredNeon,
+            '--paths=' . self::$fixtureDir . '/src',
+        ];
+        $responses = $this->invokeWithArgs($messages, $args);
+
+        $call = array_values(array_filter($responses, fn ($r) => ($r['id'] ?? null) === 2))[0] ?? null;
+        self::assertNotNull($call, 'no response for id=2');
+        self::assertArrayHasKey('result', $call, 'expected result, got: ' . json_encode($call));
+
+        $structured = $call['result']['structuredContent'] ?? null;
+        self::assertIsArray($structured);
+        self::assertSame(
+            0,
+            $structured['exit_code'],
+            'return.type is in ignoreErrors — error should be filtered out. errors=' . json_encode($structured['errors'] ?? [])
+        );
+        self::assertEmpty(
+            $structured['errors'],
+            'return.type error should be suppressed by ignoreErrors'
+        );
+    }
+
     public function testWarmBootOnSecondCall(): void
     {
         $messages = [
@@ -112,6 +156,17 @@ final class ServerStdioTest extends TestCase
 
     /**
      * @param list<array<string,mixed>> $messages
+     * @param list<string> $args
+     * @return list<array<string,mixed>>
+     */
+    private function invokeWithArgs(array $messages, array $args): array
+    {
+        $cmd = array_merge([self::$bin], $args);
+        return $this->runProcess($cmd, $messages);
+    }
+
+    /**
+     * @param list<array<string,mixed>> $messages
      * @return list<array<string,mixed>>
      */
     private function invoke(array $messages, bool $withProject = false, bool $requirePaths = true): array
@@ -129,7 +184,16 @@ final class ServerStdioTest extends TestCase
         }
 
         $cmd = array_merge([self::$bin], $args);
+        return $this->runProcess($cmd, $messages);
+    }
 
+    /**
+     * @param list<string> $cmd
+     * @param list<array<string,mixed>> $messages
+     * @return list<array<string,mixed>>
+     */
+    private function runProcess(array $cmd, array $messages): array
+    {
         $stdin = '';
         foreach ($messages as $m) {
             $stdin .= json_encode($m) . "\n";

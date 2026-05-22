@@ -17,6 +17,10 @@ namespace Dpt\McpPhpstanWarm;
  * The set of analysable files is fixed at worker boot via the paths passed
  * to `phpstan worker <paths...>`. Files outside that set may fail or return
  * dependency errors — document this constraint in the README.
+ *
+ * Global ignoreErrors from the project neon are applied here after receiving
+ * the worker result, mirroring what PHPStan's ParallelAnalyser parent process
+ * does before surfacing errors to the user.
  */
 final class PhpstanRunner
 {
@@ -35,6 +39,15 @@ final class PhpstanRunner
     private bool $handshakeDone = false;
 
     private int $serverPort = 0;
+
+    /**
+     * Cached ignoreErrors patterns loaded once at boot via `phpstan dump-parameters`.
+     * Each entry is either a string (regex) or an array with optional keys:
+     *   message (regex), rawMessage (exact), identifier (exact), path (glob), paths (list of globs).
+     *
+     * @var list<string|array<string,mixed>>|null null = not yet loaded
+     */
+    private ?array $ignoreErrors = null;
 
     public function isWarm(): bool
     {
@@ -139,6 +152,9 @@ final class PhpstanRunner
         }
 
         $this->handshakeDone = true;
+
+        // Load global ignoreErrors once per worker boot so analyse() can filter them.
+        $this->loadIgnoreErrors();
     }
 
     /**
@@ -250,7 +266,9 @@ final class PhpstanRunner
     }
 
     /**
-     * Extract structured errors from the worker result payload.
+     * Extract structured errors from the worker result payload and apply
+     * the project's global ignoreErrors filter (mirrors what PHPStan's
+     * ParallelAnalyser parent does before surfacing results to the user).
      *
      * @param array<string,mixed> $result
      * @return array{file: string, line: int, message: string, identifier: string|null}[]
@@ -266,7 +284,135 @@ final class PhpstanRunner
                 'identifier' => $e['identifier'] ?? null,
             ];
         }
-        return $errors;
+        return $this->applyIgnoreErrors($errors);
+    }
+
+    /**
+     * Load global ignoreErrors once at worker boot via `phpstan dump-parameters --json`.
+     * Stores the result in $this->ignoreErrors for reuse across analyse() calls.
+     * On any failure (no config, phpstan error, JSON parse error) we silently store
+     * an empty array — no filtering is better than crashing the daemon.
+     */
+    private function loadIgnoreErrors(): void
+    {
+        $config = getenv('MCP_PHPSTAN_CONFIG') ?: null;
+        if ($config === null) {
+            $this->ignoreErrors = [];
+            return;
+        }
+
+        $phpstanBin = $this->findPhpstanBin();
+        $args = [
+            PHP_BINARY,
+            $phpstanBin,
+            'dump-parameters',
+            '--json',
+            '--memory-limit=-1',
+            '--configuration=' . $config,
+        ];
+        $escaped = implode(' ', array_map('escapeshellarg', $args));
+
+        $output = shell_exec($escaped . ' 2>/dev/null');
+        if (!is_string($output) || $output === '') {
+            $this->ignoreErrors = [];
+            return;
+        }
+
+        $decoded = json_decode($output, true);
+        if (!is_array($decoded) || !isset($decoded['ignoreErrors']) || !is_array($decoded['ignoreErrors'])) {
+            $this->ignoreErrors = [];
+            return;
+        }
+
+        $this->ignoreErrors = array_values($decoded['ignoreErrors']);
+    }
+
+    /**
+     * Apply the cached global ignoreErrors to a list of structured errors.
+     * Mirrors PHPStan\Analyser\Ignore\IgnoredError::shouldIgnore() logic:
+     *   - string entry:                regex match on message
+     *   - array with 'identifier':     exact match on identifier  (AND'd with other conditions)
+     *   - array with 'message':        regex match on message      (AND'd)
+     *   - array with 'rawMessage':     exact match on message      (AND'd)
+     *   - array with 'path'/'paths':   fnmatch glob on file path   (AND'd)
+     * All conditions within one entry are AND'd. An error matching any entry is suppressed.
+     *
+     * @param array{file: string, line: int, message: string, identifier: string|null}[] $errors
+     * @return array{file: string, line: int, message: string, identifier: string|null}[]
+     */
+    private function applyIgnoreErrors(array $errors): array
+    {
+        if ($this->ignoreErrors === null || $this->ignoreErrors === []) {
+            return $errors;
+        }
+
+        $surviving = [];
+        foreach ($errors as $error) {
+            $suppress = false;
+            foreach ($this->ignoreErrors as $ignore) {
+                if ($this->errorMatchesIgnore($error, $ignore)) {
+                    $suppress = true;
+                    break;
+                }
+            }
+            if (!$suppress) {
+                $surviving[] = $error;
+            }
+        }
+        return $surviving;
+    }
+
+    /**
+     * @param array{file: string, line: int, message: string, identifier: string|null} $error
+     * @param string|array<string,mixed> $ignore
+     */
+    private function errorMatchesIgnore(array $error, string|array $ignore): bool
+    {
+        if (is_string($ignore)) {
+            // Plain regex pattern — match against message.
+            return @preg_match($ignore, $error['message']) === 1;
+        }
+
+        // Identifier check (exact).
+        if (isset($ignore['identifier'])) {
+            if ($error['identifier'] !== $ignore['identifier']) {
+                return false;
+            }
+        }
+
+        // Message regex check.
+        if (isset($ignore['message'])) {
+            if (@preg_match($ignore['message'], $error['message']) !== 1) {
+                return false;
+            }
+        }
+
+        // Raw (exact) message check.
+        if (isset($ignore['rawMessage'])) {
+            if ($error['message'] !== $ignore['rawMessage']) {
+                return false;
+            }
+        }
+
+        // Path glob check — 'path' (single) or 'paths' (list, OR'd).
+        if (isset($ignore['path'])) {
+            if (!fnmatch($ignore['path'], $error['file'])) {
+                return false;
+            }
+        } elseif (isset($ignore['paths']) && is_array($ignore['paths'])) {
+            $matchesAnyPath = false;
+            foreach ($ignore['paths'] as $pathPattern) {
+                if (fnmatch($pathPattern, $error['file'])) {
+                    $matchesAnyPath = true;
+                    break;
+                }
+            }
+            if (!$matchesAnyPath) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public function __destruct()

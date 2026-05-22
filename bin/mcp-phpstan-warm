@@ -52,7 +52,7 @@ if ($config !== null) {
 putenv('MCP_PHPSTAN_PATHS=' . $paths);
 
 $server = Server::builder()
-    ->setServerInfo('mcp-phpstan-warm', '0.1.0')
+    ->setServerInfo('mcp-phpstan-warm', '0.3.0')
     ->setDiscovery(dirname(__DIR__), ['src'])
     ->build();
 

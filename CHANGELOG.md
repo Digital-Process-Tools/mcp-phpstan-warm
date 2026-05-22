@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-22
+
+### Fixed
+
+- Global `ignoreErrors` patterns from the project neon are now applied to worker results,
+  mirroring what PHPStan's own `ParallelAnalyser` parent process does. Previously, errors
+  suppressed via `ignoreErrors` (by identifier, regex, or path) leaked through to the MCP
+  tool output. The filter is loaded once at worker boot via `phpstan dump-parameters --json`
+  and cached for the lifetime of the daemon.
+
 ## [0.1.0] — 2026-05-22
 
 ### Added
