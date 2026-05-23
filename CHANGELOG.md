@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-23
+
+### Fixed
+
+- **Honour neon `excludePaths` (closes [#1](https://github.com/Digital-Process-Tools/mcp-phpstan-warm/issues/1)).** The warm worker previously force-analysed files the CLI `phpstan analyse` would skip — producing false positives on test files whose lifecycle methods (`setUpBeforeClass`, `tearDownAfterClass`) weren't loaded with the project bootstrap. `PhpstanRunner` now caches `excludePaths.analyse` + `excludePaths.analyseAndScan` at boot via the same `dump-parameters --json` round-trip as `ignoreErrors`, and short-circuits `analyse()` with an empty errors list when the file matches an exclude glob. Matching covers absolute globs, relative globs (`tests/unit/*`) against any suffix of an absolute path, and `fnmatch` against both raw and realpath-resolved candidates. Check fires BEFORE `ensureWorker()` on warm calls so excluded files pay no boot cost.
+
+### Added
+
+- Unit tests `PhpstanRunnerExcludeTest` (5 cases) — absolute glob match, relative glob match, empty-list passthrough, short-circuit with allowlist, short-circuit without allowlist (legacy callers).
+
 ## [0.4.0] — 2026-05-23
 
 ### Security

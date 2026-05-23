@@ -57,6 +57,18 @@ final class PhpstanRunner
      */
     private ?array $ignoreErrors = null;
 
+    /**
+     * Cached excludePaths globs loaded once at boot via `phpstan dump-parameters`.
+     * Combined union of `excludePaths.analyse` + `excludePaths.analyseAndScan` from
+     * the neon config. Used by isExcluded() to honour neon excludes — without this,
+     * the warm worker force-analyzes files the CLI `phpstan analyse` would skip,
+     * producing false positives on test files whose lifecycle methods (setUpBeforeClass,
+     * tearDownAfterClass) aren't loaded with the right bootstrap. Closes issue #1.
+     *
+     * @var list<string>|null null = not yet loaded
+     */
+    private ?array $excludePaths = null;
+
     public function isWarm(): bool
     {
         return $this->handshakeDone && $this->isWorkerAlive();
@@ -70,6 +82,17 @@ final class PhpstanRunner
      */
     public function analyse(string $path): array
     {
+        // Issue #1: honour neon excludePaths so files the CLI phpstan would
+        // skip ("No files found to analyse.") don't get force-analysed by the
+        // warm worker. Test files excluded from the main analysis would
+        // otherwise produce confusing false positives because their
+        // lifecycle bootstrap isn't loaded. We check BEFORE ensureWorker()
+        // so an excluded file does not pay the worker boot cost — except
+        // on the very first call (excludePaths is populated by the boot).
+        if ($this->isExcluded($path)) {
+            return [];
+        }
+
         $this->ensureWorker();
 
         // Defence in depth: phpstan's worker may surface source-line context
@@ -77,6 +100,12 @@ final class PhpstanRunner
         // before they reach the worker so a hostile MCP client cannot read
         // arbitrary files (e.g. /etc/passwd, ~/.ssh/*) via parse-error leaks.
         $this->assertPathAllowed($path);
+
+        // Re-check excludes after boot — on the cold first call, excludePaths
+        // was null above, so the early gate was a no-op. Now it is populated.
+        if ($this->isExcluded($path)) {
+            return [];
+        }
 
         $request = json_encode(['action' => 'analyse', 'files' => [$path]]) . "\n";
         $written = @fwrite($this->workerStream, $request);
@@ -394,6 +423,71 @@ final class PhpstanRunner
         }
 
         $this->ignoreErrors = array_values($decoded['ignoreErrors']);
+
+        // Issue #1: extract excludePaths in the same pass — dump-parameters
+        // already gives us both. PHPStan stores them under
+        // `excludePaths.analyse` and `excludePaths.analyseAndScan`; we union
+        // them since a file in either list should be skipped by analyse().
+        $excludes = [];
+        $ex = $decoded['excludePaths'] ?? null;
+        if (is_array($ex)) {
+            foreach (['analyse', 'analyseAndScan'] as $key) {
+                if (isset($ex[$key]) && is_array($ex[$key])) {
+                    foreach ($ex[$key] as $glob) {
+                        if (is_string($glob) && $glob !== '') {
+                            $excludes[] = $glob;
+                        }
+                    }
+                }
+            }
+        }
+        $this->excludePaths = array_values(array_unique($excludes));
+    }
+
+    /**
+     * Match a file path against the cached excludePaths globs (issue #1).
+     *
+     * PHPStan's neon entries can be absolute or relative (`tests/*`). We match
+     * both shapes:
+     *   - Absolute exclude vs absolute path: direct fnmatch.
+     *   - Relative exclude vs absolute path: fnmatch against any path suffix.
+     *   - Otherwise: fnmatch the input as-is.
+     *
+     * Returns false on an empty allowlist so legacy callers keep working.
+     */
+    private function isExcluded(string $path): bool
+    {
+        if ($this->excludePaths === null || $this->excludePaths === []) {
+            return false;
+        }
+
+        $real = realpath($path);
+        $candidates = [$path];
+        if ($real !== false && $real !== $path) {
+            $candidates[] = $real;
+        }
+
+        foreach ($this->excludePaths as $glob) {
+            $isAbsolute = ($glob !== '' && $glob[0] === DIRECTORY_SEPARATOR);
+            foreach ($candidates as $candidate) {
+                if (fnmatch($glob, $candidate)) {
+                    return true;
+                }
+                // Relative glob like `tests/unit/*` should match the trailing
+                // segment of an absolute path. We test by stripping leading
+                // path components and re-matching.
+                if (!$isAbsolute) {
+                    $parts = explode(DIRECTORY_SEPARATOR, ltrim($candidate, DIRECTORY_SEPARATOR));
+                    for ($i = 0; $i < count($parts); $i++) {
+                        $tail = implode(DIRECTORY_SEPARATOR, array_slice($parts, $i));
+                        if (fnmatch($glob, $tail)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /**
