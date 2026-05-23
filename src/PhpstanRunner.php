@@ -41,6 +41,14 @@ final class PhpstanRunner
     private int $serverPort = 0;
 
     /**
+     * Realpath-normalised allowlist of analysable directories, cached at worker boot
+     * from MCP_PHPSTAN_PATHS. Per-call $path must resolve under one of these.
+     *
+     * @var list<string>|null
+     */
+    private ?array $allowedPaths = null;
+
+    /**
      * Cached ignoreErrors patterns loaded once at boot via `phpstan dump-parameters`.
      * Each entry is either a string (regex) or an array with optional keys:
      *   message (regex), rawMessage (exact), identifier (exact), path (glob), paths (list of globs).
@@ -63,6 +71,12 @@ final class PhpstanRunner
     public function analyse(string $path): array
     {
         $this->ensureWorker();
+
+        // Defence in depth: phpstan's worker may surface source-line context
+        // for parse errors. Reject paths outside the boot --paths allowlist
+        // before they reach the worker so a hostile MCP client cannot read
+        // arbitrary files (e.g. /etc/passwd, ~/.ssh/*) via parse-error leaks.
+        $this->assertPathAllowed($path);
 
         $request = json_encode(['action' => 'analyse', 'files' => [$path]]) . "\n";
         $written = @fwrite($this->workerStream, $request);
@@ -153,8 +167,58 @@ final class PhpstanRunner
 
         $this->handshakeDone = true;
 
+        // Cache realpath of declared analyse paths once per worker boot — used
+        // by assertPathAllowed() in analyse() to reject out-of-allowlist paths.
+        $this->loadAllowedPaths();
+
         // Load global ignoreErrors once per worker boot so analyse() can filter them.
         $this->loadIgnoreErrors();
+    }
+
+    /**
+     * Populate $allowedPaths from MCP_PHPSTAN_PATHS. Each entry is realpath-resolved;
+     * unresolvable entries are dropped. Empty result = no containment (legacy / dev
+     * usage where the operator did not constrain paths).
+     */
+    private function loadAllowedPaths(): void
+    {
+        $pathsRaw = getenv('MCP_PHPSTAN_PATHS') ?: '';
+        $resolved = [];
+        foreach (array_filter(array_map('trim', explode(',', $pathsRaw))) as $p) {
+            $real = realpath($p);
+            if ($real !== false) {
+                $resolved[] = $real;
+            }
+        }
+        $this->allowedPaths = array_values(array_unique($resolved));
+    }
+
+    /**
+     * Reject paths that escape the boot allowlist before they reach the phpstan
+     * worker. Uses realpath canonicalisation so symlinks and `..` traversal cannot
+     * sneak past. Throws \RuntimeException with a deliberately terse message — we
+     * do not echo the user-supplied path back in case the MCP client is hostile.
+     */
+    private function assertPathAllowed(string $path): void
+    {
+        if ($this->allowedPaths === null || $this->allowedPaths === []) {
+            // No allowlist configured — preserve legacy behaviour. Operators who
+            // want hardening must pass --paths at boot.
+            return;
+        }
+
+        $real = realpath($path);
+        if ($real === false) {
+            throw new \RuntimeException('analyse: path does not exist or is not readable.');
+        }
+
+        foreach ($this->allowedPaths as $allowed) {
+            if ($real === $allowed || str_starts_with($real, $allowed . DIRECTORY_SEPARATOR)) {
+                return;
+            }
+        }
+
+        throw new \RuntimeException('analyse: path is outside the configured --paths allowlist.');
     }
 
     /**
@@ -186,8 +250,13 @@ final class PhpstanRunner
 
         $escaped = implode(' ', array_map('escapeshellarg', $args));
 
-        $logStdout = sys_get_temp_dir() . '/mcp-phpstan-worker-stdout.log';
-        $logStderr = sys_get_temp_dir() . '/mcp-phpstan-worker-stderr.log';
+        // Per-process random suffix on log file names — fixed names in /tmp are
+        // a symlink-attack vector on multi-user hosts (attacker pre-creates the
+        // path as a symlink to a victim-writable file; phpstan stderr gets
+        // appended to it). Suffix randomises the path so pre-creation fails.
+        $logSuffix = getmypid() . '-' . bin2hex(random_bytes(8));
+        $logStdout = sys_get_temp_dir() . '/mcp-phpstan-worker-' . $logSuffix . '-stdout.log';
+        $logStderr = sys_get_temp_dir() . '/mcp-phpstan-worker-' . $logSuffix . '-stderr.log';
 
         $proc = proc_open($escaped, [
             0 => ['pipe', 'r'],
