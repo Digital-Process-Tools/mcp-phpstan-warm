@@ -16,6 +16,32 @@ final class ServerStdioTest extends TestCase
     private static string $fixtureDir;
     private static string $fixtureFile;
 
+    /** @var list<string> temp project dirs created per test, removed in tearDown */
+    private array $tmpDirs = [];
+
+    protected function tearDown(): void
+    {
+        foreach ($this->tmpDirs as $dir) {
+            $this->removeDir($dir);
+        }
+        $this->tmpDirs = [];
+    }
+
+    private function removeDir(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($items as $item) {
+            $item->isDir() ? rmdir($item->getPathname()) : unlink($item->getPathname());
+        }
+        rmdir($dir);
+    }
+
     public static function setUpBeforeClass(): void
     {
         self::$bin = dirname(__DIR__, 2) . '/bin/mcp-phpstan-warm';
@@ -152,6 +178,162 @@ final class ServerStdioTest extends TestCase
         self::assertNotNull($third, 'no response for id=3');
         $structured = $third['result']['structuredContent'];
         self::assertTrue($structured['warm_boot'], 'second tools/call should reuse warm worker');
+    }
+
+    /**
+     * Staleness guard: an edit made BETWEEN two analyse calls on the same warm
+     * worker must be reflected on the second call.
+     *
+     * Unlike phpunit (which *executes* classes and so can't reload them — see
+     * mcp-phpunit-warm#... / claude-supertool#265), phpstan parses source to an
+     * AST and rebuilds reflection from it, so re-analysing a re-read file should
+     * surface the edit. This test pins that: clean file → 0 errors, introduce a
+     * type error on disk → the same warm worker reports it.
+     */
+    public function testEditedSourceIsReanalysedAcrossCalls(): void
+    {
+        $project = $this->makeProject(withError: false);
+        $file    = $project . '/src/StanProbe.php';
+
+        $proc = $this->spawnServer($project);
+
+        try {
+            $this->send($proc['stdin'], ['jsonrpc' => '2.0', 'id' => 1, 'method' => 'initialize', 'params' => [
+                'protocolVersion' => '2024-11-05',
+                'capabilities'    => new \stdClass(),
+                'clientInfo'      => ['name' => 'phpunit', 'version' => '1.0.0'],
+            ]]);
+            $this->send($proc['stdin'], ['jsonrpc' => '2.0', 'method' => 'notifications/initialized']);
+
+            // Clean file → no errors.
+            $this->send($proc['stdin'], $this->analyseCall(2, $file));
+            $first = $this->readResponse($proc['stdout'], 2);
+            self::assertSame(
+                0,
+                $first['result']['structuredContent']['exit_code'],
+                'clean fixture should analyse with no errors, got: ' . json_encode($first['result']['structuredContent'] ?? []) . $this->stderrTail($proc['stderr'])
+            );
+
+            // Introduce a type error on disk; bump mtime past 1s granularity.
+            file_put_contents($file, $this->probeClass(withError: true));
+            touch($file, time() + 5);
+
+            // Same warm worker must re-read the file and report the new error.
+            $this->send($proc['stdin'], $this->analyseCall(3, $file));
+            $second = $this->readResponse($proc['stdout'], 3);
+            $structured = $second['result']['structuredContent'];
+            self::assertTrue($structured['warm_boot'], 'second call should reuse the warm worker' . $this->stderrTail($proc['stderr']));
+            self::assertSame(
+                1,
+                $structured['exit_code'],
+                'edited source introduces a type error — warm worker must re-analyse and report it (stale reflection would still report 0)' . $this->stderrTail($proc['stderr'])
+            );
+            self::assertNotEmpty($structured['errors']);
+            // Specifically the introduced return-type mismatch, not just any error.
+            self::assertStringContainsStringIgnoringCase(
+                'string',
+                $structured['errors'][0]['message'] ?? '',
+                'expected the return-type error (int returned where string declared), got: ' . json_encode($structured['errors'])
+            );
+        } finally {
+            fclose($proc['stdin']);
+            stream_get_contents($proc['stdout']);
+            fclose($proc['stdout']);
+            proc_close($proc['handle']);
+        }
+    }
+
+    /**
+     * @return array{handle: resource, stdin: resource, stdout: resource, stderr: string}
+     */
+    private function spawnServer(string $project): array
+    {
+        // Capture stderr to a file (not /dev/null) so a CI failure has diagnostics.
+        $stderr = $project . '/server.stderr';
+        $cmd = [
+            self::$bin,
+            '--working-dir=' . $project,
+            '--config=' . $project . '/phpstan.neon',
+            '--paths=' . $project . '/src',
+        ];
+        $proc = proc_open(
+            $cmd,
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $stderr, 'w']],
+            $pipes,
+        );
+        self::assertIsResource($proc);
+
+        return ['handle' => $proc, 'stdin' => $pipes[0], 'stdout' => $pipes[1], 'stderr' => $stderr];
+    }
+
+    private function stderrTail(string $path): string
+    {
+        $contents = @file_get_contents($path);
+
+        return ($contents === false || $contents === '') ? '' : ' | server stderr: ' . substr($contents, -1500);
+    }
+
+    /**
+     * @param resource            $stdin
+     * @param array<string,mixed> $message
+     */
+    private function send($stdin, array $message): void
+    {
+        fwrite($stdin, json_encode($message) . "\n");
+        fflush($stdin);
+    }
+
+    /**
+     * Block reading newline-delimited JSON-RPC until the response with $id arrives.
+     * PHPStan worker cold boot can take ~10s — allow a generous read timeout.
+     *
+     * @param resource $stdout
+     * @return array<string,mixed>
+     */
+    private function readResponse($stdout, int $id): array
+    {
+        stream_set_timeout($stdout, 120);
+        while (($line = fgets($stdout)) !== false) {
+            $line = trim($line);
+            if ($line === '' || $line[0] !== '{') {
+                continue;
+            }
+            $decoded = json_decode($line, true);
+            if (is_array($decoded) && ($decoded['id'] ?? null) === $id) {
+                return $decoded;
+            }
+        }
+
+        self::fail("no response for id={$id}");
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function analyseCall(int $id, string $file): array
+    {
+        return ['jsonrpc' => '2.0', 'id' => $id, 'method' => 'tools/call', 'params' => [
+            'name'      => 'phpstan_analyse',
+            'arguments' => ['path' => $file],
+        ]];
+    }
+
+    private function makeProject(bool $withError): string
+    {
+        $dir = sys_get_temp_dir() . '/phpstan_mcp_regr_' . bin2hex(random_bytes(6));
+        mkdir($dir . '/src', 0777, true);
+        $this->tmpDirs[] = $dir;
+
+        file_put_contents($dir . '/src/StanProbe.php', $this->probeClass($withError));
+        file_put_contents($dir . '/phpstan.neon', "parameters:\n    level: 5\n    paths:\n        - src\n");
+
+        return $dir;
+    }
+
+    private function probeClass(bool $withError): string
+    {
+        $body = $withError ? 'return 42;' : "return 'ok';";
+        return "<?php\n\ndeclare(strict_types=1);\n\nfinal class StanProbe\n{\n    public function getLabel(): string\n    {\n        {$body}\n    }\n}\n";
     }
 
     /**
