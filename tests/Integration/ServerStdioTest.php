@@ -244,6 +244,74 @@ final class ServerStdioTest extends TestCase
     }
 
     /**
+     * Cross-file staleness guard: editing a DEPENDENCY between analyse calls must
+     * be reflected when a DEPENDENT is analysed next.
+     *
+     * The earlier test only edits the file being analysed — phpstan re-reads the
+     * target's AST, so that path was always fine. The trap is a dependency: the
+     * worker memoises a class's reflection for its whole life and re-analysing the
+     * dependency alone does NOT refresh it, so a dependent re-analysed afterwards
+     * was served the stale reflection and SILENTLY missed an error a cold run
+     * catches. The runner now respawns the worker when a non-target analysed file
+     * changed since boot. This pins it: User::go() calls Dep::value(); remove
+     * Dep::value() on disk; re-analysing User must report the undefined method.
+     */
+    public function testStaleDependencyIsCaughtWhenDependentReanalysed(): void
+    {
+        $project = $this->makeDependencyProject();
+        $user    = $project . '/src/User.php';
+        $dep     = $project . '/src/Dep.php';
+
+        $proc = $this->spawnServer($project);
+
+        try {
+            $this->send($proc['stdin'], ['jsonrpc' => '2.0', 'id' => 1, 'method' => 'initialize', 'params' => [
+                'protocolVersion' => '2024-11-05',
+                'capabilities'    => new \stdClass(),
+                'clientInfo'      => ['name' => 'phpunit', 'version' => '1.0.0'],
+            ]]);
+            $this->send($proc['stdin'], ['jsonrpc' => '2.0', 'method' => 'notifications/initialized']);
+
+            // Dependent is clean while Dep::value() exists.
+            $this->send($proc['stdin'], $this->analyseCall(2, $user));
+            self::assertSame(
+                0,
+                $this->readResponse($proc['stdout'], 2)['result']['structuredContent']['exit_code'],
+                'User should be clean while Dep::value() exists' . $this->stderrTail($proc['stderr'])
+            );
+
+            // Remove the depended-on method on disk (mirrors editing the dependency),
+            // then validate the edited dependency itself — Dep alone is still fine.
+            file_put_contents($dep, "<?php\n\ndeclare(strict_types=1);\n\nfinal class Dep\n{\n    public function other(): int\n    {\n        return 2;\n    }\n}\n");
+            touch($dep, time() + 5);
+            $this->send($proc['stdin'], $this->analyseCall(3, $dep));
+            $this->readResponse($proc['stdout'], 3);
+
+            // Re-analyse the dependent. The worker reflected Dep with value() at boot;
+            // without a respawn it would still report 0. It must now report the call
+            // to the now-undefined Dep::value().
+            $this->send($proc['stdin'], $this->analyseCall(4, $user));
+            $structured = $this->readResponse($proc['stdout'], 4)['result']['structuredContent'];
+            self::assertSame(
+                1,
+                $structured['exit_code'],
+                'editing the dependency must surface on the dependent (stale reflection would report 0)' . $this->stderrTail($proc['stderr'])
+            );
+            self::assertNotEmpty($structured['errors']);
+            self::assertStringContainsStringIgnoringCase(
+                'value',
+                $structured['errors'][0]['message'] ?? '',
+                'expected the undefined-method error on Dep::value(), got: ' . json_encode($structured['errors'])
+            );
+        } finally {
+            fclose($proc['stdin']);
+            stream_get_contents($proc['stdout']);
+            fclose($proc['stdout']);
+            proc_close($proc['handle']);
+        }
+    }
+
+    /**
      * @return array{handle: resource, stdin: resource, stdout: resource, stderr: string}
      */
     private function spawnServer(string $project): array
@@ -325,6 +393,29 @@ final class ServerStdioTest extends TestCase
         $this->tmpDirs[] = $dir;
 
         file_put_contents($dir . '/src/StanProbe.php', $this->probeClass($withError));
+        file_put_contents($dir . '/phpstan.neon', "parameters:\n    level: 5\n    paths:\n        - src\n");
+
+        return $dir;
+    }
+
+    /**
+     * Two-file fixture for the cross-file staleness test: Dep declares value(),
+     * User calls it. Editing Dep on disk must surface when User is re-analysed.
+     */
+    private function makeDependencyProject(): string
+    {
+        $dir = sys_get_temp_dir() . '/phpstan_mcp_dep_' . bin2hex(random_bytes(6));
+        mkdir($dir . '/src', 0777, true);
+        $this->tmpDirs[] = $dir;
+
+        file_put_contents(
+            $dir . '/src/Dep.php',
+            "<?php\n\ndeclare(strict_types=1);\n\nfinal class Dep\n{\n    public function value(): int\n    {\n        return 1;\n    }\n}\n"
+        );
+        file_put_contents(
+            $dir . '/src/User.php',
+            "<?php\n\ndeclare(strict_types=1);\n\nfinal class User\n{\n    public function go(): int\n    {\n        return (new Dep())->value();\n    }\n}\n"
+        );
         file_put_contents($dir . '/phpstan.neon', "parameters:\n    level: 5\n    paths:\n        - src\n");
 
         return $dir;

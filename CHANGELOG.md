@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-21
+
+### Fixed
+
+- **Cross-file reflection staleness: warm no longer silently misses errors cold catches.** The warm worker memoises a class's reflection for its whole life, and re-analysing a file only re-reads *that file's* AST — it never refreshes the reflection of its **dependencies**. So after a dependency was edited (e.g. a method removed), re-analysing a dependent that calls it returned **0 errors**, while a cold `phpstan` run reported the now-undefined call. Unlike the same-file edit case (already handled — phpstan re-reads the analysed file), this is cross-file and was silent. The sibling of the loud rector failure in claude-supertool#273. PHPStan's worker exposes no per-class invalidation, so `PhpstanRunner` now **respawns the worker when a non-target file it has analysed changed since the worker booted** (`workerBootedAt` + an analysed-file set, checked before `ensureWorker()`). The respawn is scoped: the analysis **target is excluded** (phpstan re-reads it anyway), so iterating on a single file never respawns and stays fully warm — the cold boot is paid only when you switch to a different file after editing a dependency. The staleness check stats only the analysed working set, not the whole `--paths` tree.
+
+### Added
+
+- `testStaleDependencyIsCaughtWhenDependentReanalysed` — integration regression: edit a dependency on disk, then re-analyse a dependent through the same warm worker and assert the now-undefined call is reported (proven red without the respawn, green with it).
+
 ## [0.5.0] — 2026-05-23
 
 ### Fixed
