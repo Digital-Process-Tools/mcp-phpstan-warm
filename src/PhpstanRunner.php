@@ -69,6 +69,27 @@ final class PhpstanRunner
      */
     private ?array $excludePaths = null;
 
+    /**
+     * Unix time the live worker (re)booted. The worker reflects every source file
+     * as of this moment and memoises it for its whole life — re-analysing a file
+     * never refreshes its reflection for OTHER files (verified). So a dependency
+     * edited after this timestamp is served stale to its dependents: warm silently
+     * misses an error cold catches (the cross-file sibling of claude-supertool#273).
+     * The only cure is a respawn; this is the baseline staleness is measured against.
+     */
+    private ?int $workerBootedAt = null;
+
+    /**
+     * Set of files the caller has analysed through this worker (path => true).
+     * Bounds the per-call staleness check to the working set instead of stat-ing
+     * the whole --paths tree (tens of thousands of files on a real project). A
+     * file here whose mtime is newer than {@see $workerBootedAt} is stale in the
+     * worker and forces a respawn before the next dependent is analysed.
+     *
+     * @var array<string,bool>
+     */
+    private array $analysedFiles = [];
+
     public function isWarm(): bool
     {
         return $this->handshakeDone && $this->isWorkerAlive();
@@ -91,6 +112,18 @@ final class PhpstanRunner
         // on the very first call (excludePaths is populated by the boot).
         if ($this->isExcluded($path)) {
             return [];
+        }
+
+        // Correctness over warmth when a dependency moved: if any file we've
+        // analysed OTHER than the target has changed since the worker booted, the
+        // worker's memoised reflection of it is stale and re-analysing won't
+        // refresh it — only a fresh worker will. Respawn before analysing so the
+        // dependent is checked against current reflection. The target itself is
+        // excluded (phpstan re-reads the analysed file's own AST each call), so
+        // iterating on a single file never respawns and stays fully warm. Checked
+        // before ensureWorker() so the teardown + reboot happen in one step.
+        if ($this->isWarm() && $this->dependencyChangedSinceBoot($path)) {
+            $this->teardown();
         }
 
         $this->ensureWorker();
@@ -124,7 +157,34 @@ final class PhpstanRunner
             throw new \RuntimeException('Unexpected worker response: ' . trim($line));
         }
 
+        // Remember we've reflected this file so a later edit to it registers as a
+        // stale dependency for whatever analyses it next.
+        $this->analysedFiles[$path] = true;
+
         return $this->extractErrors($decoded['result'] ?? []);
+    }
+
+    /**
+     * True when a file we've analysed — other than $target — has an on-disk mtime
+     * at or after the worker's boot, i.e. it was edited since the worker reflected
+     * it. Bounded to the analysed set, so the check costs a handful of stat() calls,
+     * not a walk of the whole --paths tree.
+     */
+    private function dependencyChangedSinceBoot(string $target): bool
+    {
+        if ($this->workerBootedAt === null) {
+            return false;
+        }
+        foreach ($this->analysedFiles as $file => $_) {
+            if ($file === $target) {
+                continue;
+            }
+            $mtime = @filemtime($file);
+            if ($mtime !== false && $mtime >= $this->workerBootedAt) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -139,6 +199,10 @@ final class PhpstanRunner
 
         // Clean up dead state before respawning.
         $this->teardown();
+
+        // Stamp the boot moment BEFORE the worker reads any source: every file is
+        // reflected as of now, so a later edit (mtime >= this) is detectably stale.
+        $this->workerBootedAt = time();
 
         // 1. Open TCP server on a random port.
         $this->serverSocket = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
@@ -345,6 +409,10 @@ final class PhpstanRunner
     private function teardown(): void
     {
         $this->handshakeDone = false;
+        // The staleness baseline belongs to the dead worker — a respawn reflects
+        // every file fresh, so reset it together with the analysed-file set.
+        $this->workerBootedAt = null;
+        $this->analysedFiles = [];
 
         if (is_resource($this->workerStream)) {
             @fclose($this->workerStream);
