@@ -6,6 +6,20 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-25
+
+### Fixed
+
+- **Same-file reflection staleness: a class-level generic edit kept being checked against the pre-edit shape.** 0.6.0 excluded the analysis target from the staleness check on the grounds that "phpstan re-reads the analysed file". That is true of the file's **AST** and false of its **reflection**: after editing a class-level `@extends`/`@template` generic, the warm worker kept resolving `$this->options` against the shape captured at first analysis, so a genuine fix kept reporting the error it had just fixed (and, symmetrically, a newly *introduced* shape error would be missed). `PhpstanRunner` now fingerprints each analysed file's **structure** — declarations, signatures, property types and docblocks, with function bodies stripped — and respawns when the target's fingerprint changes. Body-only edits leave the fingerprint untouched, so the edit-validate-edit loop on one file stays fully warm (measured: 0.0s per warm call, ~6s only when the structure actually changes).
+- **Classes created after the worker booted were invisible.** The worker's analysable file set is fixed at boot, so a class added afterwards produced `class.notFound` ("extends unknown class …") for a file sitting on disk that a cold run resolves fine — plus knock-on phantom errors at stale line numbers. Indistinguishable from a genuinely missing class by content alone, so `analyse()` now pays one respawn when a result contains `class.notFound` and returns the fresh worker's verdict. Bounded to a single retry per call.
+- **A globally-installed server analysed with its own phpstan.** `findPhpstanBin()` resolved phpstan from the server's own vendor directory, so a global install would analyse a project with the wrong phpstan — missing every extension and custom rule the project's config declares, and reporting far too little. `MCP_PHPSTAN_PHPSTAN_BIN` now takes precedence and fails loudly when it points at nothing.
+
+### Added
+
+- `MCP_PHPSTAN_PHPSTAN_BIN` env var — point the server at the project's phpstan binary explicitly.
+- `PhpstanRunner::structuralSignature()` / `targetStructureChanged()` / `hasUnknownClassError()` / `sendAnalyse()` (private).
+- Unit tests `PhpstanRunnerStalenessTest` (11 cases): body-only edits keep the signature stable, class-level generics / method signatures / property types change it, formatting and line comments do not, bodyless abstract methods do not derail the scanner, plus the binary-override contract.
+
 ## [0.6.0] — 2026-06-21
 
 ### Fixed
