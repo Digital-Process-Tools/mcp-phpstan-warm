@@ -80,13 +80,14 @@ final class PhpstanRunner
     private ?int $workerBootedAt = null;
 
     /**
-     * Set of files the caller has analysed through this worker (path => true).
+     * Files the caller has analysed through this worker, mapped to the structural
+     * signature they had when the worker reflected them ({@see structuralSignature}).
      * Bounds the per-call staleness check to the working set instead of stat-ing
      * the whole --paths tree (tens of thousands of files on a real project). A
      * file here whose mtime is newer than {@see $workerBootedAt} is stale in the
      * worker and forces a respawn before the next dependent is analysed.
      *
-     * @var array<string,bool>
+     * @var array<string,string>
      */
     private array $analysedFiles = [];
 
@@ -114,15 +115,21 @@ final class PhpstanRunner
             return [];
         }
 
-        // Correctness over warmth when a dependency moved: if any file we've
-        // analysed OTHER than the target has changed since the worker booted, the
-        // worker's memoised reflection of it is stale and re-analysing won't
-        // refresh it — only a fresh worker will. Respawn before analysing so the
-        // dependent is checked against current reflection. The target itself is
-        // excluded (phpstan re-reads the analysed file's own AST each call), so
-        // iterating on a single file never respawns and stays fully warm. Checked
-        // before ensureWorker() so the teardown + reboot happen in one step.
-        if ($this->isWarm() && $this->dependencyChangedSinceBoot($path)) {
+        // Correctness over warmth when reflection moved under us. Two ways that
+        // happens, both needing a respawn — re-analysing never refreshes memoised
+        // reflection, only a fresh worker does:
+        //
+        //   1. A dependency we've analysed changed since boot (mtime check).
+        //   2. The TARGET's own structure changed since we reflected it. PHPStan
+        //      re-reads the analysed file's AST every call, so body edits are seen
+        //      immediately — but the class's memoised *reflection* is not rebuilt,
+        //      so an edit to a class-level @extends/@template generic keeps being
+        //      checked against the shape captured at first analysis.
+        //
+        // Body-only edits leave the structural signature untouched, so the common
+        // edit-validate-edit loop on one file stays fully warm. Checked before
+        // ensureWorker() so the teardown + reboot happen in one step.
+        if ($this->isWarm() && ($this->dependencyChangedSinceBoot($path) || $this->targetStructureChanged($path))) {
             $this->teardown();
         }
 
@@ -140,6 +147,34 @@ final class PhpstanRunner
             return [];
         }
 
+        $errors = $this->extractErrors($this->sendAnalyse($path));
+
+        // A class created after the worker booted is invisible to it: the analysable
+        // file set is fixed at boot, so the worker reports "unknown class" for a class
+        // sitting on disk that a cold run resolves fine. Indistinguishable from a real
+        // missing class by content alone — so pay one respawn to find out, and trust
+        // the fresh worker. Bounded to a single retry per call.
+        if ($this->hasUnknownClassError($errors)) {
+            $this->teardown();
+            $this->ensureWorker();
+            $errors = $this->extractErrors($this->sendAnalyse($path));
+        }
+
+        // Remember the structure we reflected, so a later edit to it registers as
+        // stale — for this file as a dependency, and for itself on re-analysis.
+        $this->analysedFiles[$path] = $this->structuralSignature($path);
+
+        return $errors;
+    }
+
+    /**
+     * One analyse round-trip on the live worker stream.
+     *
+     * @return array<string,mixed> the worker's raw `result` payload
+     * @throws \RuntimeException on protocol errors
+     */
+    private function sendAnalyse(string $path): array
+    {
         $request = json_encode(['action' => 'analyse', 'files' => [$path]]) . "\n";
         $written = @fwrite($this->workerStream, $request);
         if ($written === false || $written === 0) {
@@ -157,11 +192,26 @@ final class PhpstanRunner
             throw new \RuntimeException('Unexpected worker response: ' . trim($line));
         }
 
-        // Remember we've reflected this file so a later edit to it registers as a
-        // stale dependency for whatever analyses it next.
-        $this->analysedFiles[$path] = true;
+        $result = $decoded['result'] ?? [];
 
-        return $this->extractErrors($decoded['result'] ?? []);
+        return is_array($result) ? $result : [];
+    }
+
+    /**
+     * Errors that mean "the worker does not know this class" — the signature of a
+     * class file created after boot, not of a genuine mistake in the analysed file.
+     *
+     * @param array{file: string, line: int, message: string, identifier: string|null}[] $errors
+     */
+    private function hasUnknownClassError(array $errors): bool
+    {
+        foreach ($errors as $error) {
+            if (($error['identifier'] ?? null) === 'class.notFound') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -185,6 +235,84 @@ final class PhpstanRunner
             }
         }
         return false;
+    }
+
+    /**
+     * True when the target's structure changed since this worker reflected it.
+     * Only meaningful for a file we have already analysed — an unseen file has no
+     * memoised reflection to be stale.
+     */
+    private function targetStructureChanged(string $target): bool
+    {
+        $reflected = $this->analysedFiles[$target] ?? null;
+
+        return $reflected !== null && $reflected !== $this->structuralSignature($target);
+    }
+
+    /**
+     * Hash of everything in a file that shapes its reflection: declarations, type
+     * hints, docblocks — with function bodies removed. Editing a method body leaves
+     * this untouched (worker stays warm); changing a class-level generic, a
+     * signature, a property type or a docblock changes it (worker respawns).
+     *
+     * Regular comments are dropped, docblocks are kept — PHPStan reads the latter
+     * as types. Unparseable input hashes to the empty string, which compares equal
+     * across calls and so never forces a respawn on its own; phplint catches those
+     * files before they reach here anyway.
+     */
+    private function structuralSignature(string $path): string
+    {
+        $source = @file_get_contents($path);
+        if ($source === false) {
+            return '';
+        }
+
+        $tokens = @token_get_all($source);
+        $signature = '';
+        $depth = 0;
+        $bodyDepth = null;
+        $pendingFunction = false;
+
+        foreach ($tokens as $token) {
+            $id = is_array($token) ? $token[0] : null;
+            $text = is_array($token) ? $token[1] : $token;
+
+            if ($id === T_WHITESPACE || $id === T_COMMENT) {
+                continue;
+            }
+
+            if ($id === T_FUNCTION) {
+                $pendingFunction = true;
+            }
+
+            // Abstract and interface methods end at `;` with no body to skip.
+            if ($text === ';' && $pendingFunction) {
+                $pendingFunction = false;
+            }
+
+            if ($text === '{') {
+                $depth++;
+                if ($pendingFunction && $bodyDepth === null) {
+                    $bodyDepth = $depth;
+                    $pendingFunction = false;
+                }
+            } elseif ($text === '}') {
+                if ($bodyDepth !== null && $depth === $bodyDepth) {
+                    $bodyDepth = null;
+                    $depth--;
+                    continue;
+                }
+                $depth--;
+            }
+
+            if ($bodyDepth !== null) {
+                continue;
+            }
+
+            $signature .= $text . '|';
+        }
+
+        return hash('sha256', $signature);
     }
 
     /**
@@ -369,6 +497,20 @@ final class PhpstanRunner
 
     private function findPhpstanBin(): string
     {
+        // Explicit override wins. Needed whenever the server and the analysed project
+        // resolve to different phpstan installs — a global install of this server would
+        // otherwise analyse with its own phpstan, missing every extension and custom
+        // rule the project's config declares, and silently reporting far too little.
+        $override = getenv('MCP_PHPSTAN_PHPSTAN_BIN') ?: '';
+        if ($override !== '') {
+            $resolved = realpath($override);
+            if ($resolved === false || !is_file($resolved)) {
+                throw new \RuntimeException('MCP_PHPSTAN_PHPSTAN_BIN does not point at a file: ' . $override);
+            }
+
+            return $resolved;
+        }
+
         // phpstan/phpstan ships as a phar — classes inside it are not directly reflectable.
         // Use Composer's InstalledVersions to locate the package directory, then resolve the phar.
         if (class_exists(\Composer\InstalledVersions::class)) {

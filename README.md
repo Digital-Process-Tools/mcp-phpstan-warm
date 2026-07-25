@@ -132,9 +132,13 @@ Three things worth knowing:
 
 3. **Worker death is handled transparently.** If `proc_get_status()` shows the worker died, the next `phpstan_analyse` call respawns it. The `warm_boot: false` flag in the response signals this happened.
 
+4. **Reflection is memoised for the worker's lifetime, so staleness is managed by respawning.** A warm worker never rebuilds a class's reflection, and the analysed file set is fixed at boot — so the server respawns when it detects that the answer would otherwise be stale: an analysed dependency changed on disk, the target's own *structure* changed (declarations, signatures, property types, docblocks — bodies excluded), or a result mentions an unknown class that may have been created after boot. Editing method bodies never triggers a respawn, so the usual edit-check-edit loop stays warm.
+
 ## FAQ
 
 **Does this replace `vendor/bin/phpstan`?** No. Use it from MCP clients. For one-off CLI runs the regular binary is simpler.
+
+**Which phpstan does it analyse with?** The one it resolves from its own install — correct when the server is a dev dependency of the project it analyses. If it is installed globally, or you are testing a server build against another project, set `MCP_PHPSTAN_PHPSTAN_BIN=/path/to/project/vendor/phpstan/phpstan/phpstan.phar`. Getting this wrong is quiet rather than loud: the wrong phpstan loads none of your config's extensions or custom rules and simply reports less.
 
 **Can I analyse multiple files at once?** The current tool accepts one file per call. The underlying protocol supports `"files":[...]` arrays — multi-file support can be added as a separate tool.
 
